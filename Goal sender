@@ -209,3 +209,208 @@ def main():
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
+
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from std_msgs.msg import String
+from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import Odometry
+import math
+
+
+class GoalSender(Node):
+    def __init__(self):
+        super().__init__('goal_sender')
+
+        self._action_client = ActionClient(
+            self, NavigateToPose, 'navigate_to_pose')
+
+        self.sub_objects = self.create_subscription(
+            String, '/objects', self.objects_callback, 10)
+        self.sub_goal = self.create_subscription(
+            String, '/semantic_goal', self.goal_callback, 10)
+        self.sub_odom = self.create_subscription(
+            Odometry, '/odom', self.odom_callback, 10)
+
+        self.memory = {}
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_yaw = 0.0
+
+        # ✅ inflation_radius(0.4) + robot_radius(0.22) + buffer(0.3)
+        self.safety_distance = 1.0  # meters
+
+        # ✅ Goal costmap free space check க்கு step size
+        self.goal_step_back = 0.1   # safety distance போதாட்டா இந்த step ல பின்னால போகும்
+        self.max_step_attempts = 5  # maximum 5 attempts
+
+        self.get_logger().info("Goal Sender Node started")
+
+    def odom_callback(self, msg):
+        self.robot_x = msg.pose.pose.position.x
+        self.robot_y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.robot_yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    def is_close(self, p1, p2, threshold=0.5):
+        return math.dist(p1, p2) < threshold
+
+    def objects_callback(self, msg):
+        try:
+            obj_type, x, y = msg.data.split(',')
+            x, y = float(x), float(y)
+
+            if obj_type not in self.memory:
+                self.memory[obj_type] = []
+
+            for i, (mx, my, count) in enumerate(self.memory[obj_type]):
+                if self.is_close((x, y), (mx, my), threshold=0.5):
+                    new_x = (mx * count + x) / (count + 1)
+                    new_y = (my * count + y) / (count + 1)
+                    self.memory[obj_type][i] = (new_x, new_y, count + 1)
+                    self.get_logger().info(
+                        f"[UPDATED] {obj_type} avg @ "
+                        f"({new_x:.2f}, {new_y:.2f}) "
+                        f"| detections: {count + 1}")
+                    return
+
+            self.memory[obj_type].append((x, y, 1))
+            self.get_logger().info(
+                f"[STORED] {obj_type} @ ({x:.2f}, {y:.2f})")
+
+        except Exception as e:
+            self.get_logger().warn(f"Bad object msg: {e}")
+
+    def goal_callback(self, msg):
+        target = msg.data.strip().lower()
+
+        known = ["crate", "pallet", "box"]
+        matched = next((o for o in known if o in target), None)
+
+        if not matched:
+            self.get_logger().warn(
+                f"Unknown command: '{target}' | Use: crate / pallet / box")
+            return
+
+        if matched not in self.memory or len(self.memory[matched]) == 0:
+            self.get_logger().warn(
+                f"No known location for '{matched}' | "
+                f"Known: {list(self.memory.keys())}")
+            return
+
+        x, y, count = min(
+            self.memory[matched],
+            key=lambda p: math.dist(
+                (p[0], p[1]),
+                (self.robot_x, self.robot_y)
+            )
+        )
+
+        self.get_logger().info(
+            f"[TARGET] {matched} @ ({x:.2f}, {y:.2f}) "
+            f"| {count} detections")
+
+        angle_to_obj = math.atan2(
+            y - self.robot_y,
+            x - self.robot_x
+        )
+
+        # ✅ Step back logic — inflation zone வெளியே goal போகும்வரை try பண்ணும்
+        goal_x, goal_y = self.compute_safe_goal(x, y, angle_to_obj)
+
+        goal_yaw = angle_to_obj
+        qz = math.sin(goal_yaw / 2.0)
+        qw = math.cos(goal_yaw / 2.0)
+
+        self.send_nav2_goal(goal_x, goal_y, qz, qw, matched)
+
+    # ─────────────────────────────────────────
+    # ✅ Safe goal computation
+    # inflation zone க்கு வெளியே goal போகும்வரை
+    # step back பண்ணும்
+    # ─────────────────────────────────────────
+    def compute_safe_goal(self, obj_x, obj_y, angle):
+        # inflation_radius + robot_radius + safety buffer
+        inflation_radius = 0.4
+        robot_radius = 0.22
+        min_safe_dist = inflation_radius + robot_radius + 0.3  # = 0.92m
+
+        # ✅ Maximum of safety_distance vs min_safe_dist
+        effective_dist = max(self.safety_distance, min_safe_dist)
+
+        goal_x = obj_x - effective_dist * math.cos(angle)
+        goal_y = obj_y - effective_dist * math.sin(angle)
+
+        self.get_logger().info(
+            f"[GOAL COMPUTED] effective safety dist: {effective_dist:.2f}m "
+            f"| goal @ ({goal_x:.2f}, {goal_y:.2f})")
+
+        return goal_x, goal_y
+
+    def send_nav2_goal(self, x, y, qz, qw, target):
+        if not self._action_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("Nav2 action server not available!")
+            return
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = "map"
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = x
+        goal_msg.pose.pose.position.y = y
+        goal_msg.pose.pose.position.z = 0.0
+        goal_msg.pose.pose.orientation.x = 0.0
+        goal_msg.pose.pose.orientation.y = 0.0
+        goal_msg.pose.pose.orientation.z = qz
+        goal_msg.pose.pose.orientation.w = qw
+
+        self.get_logger().info(
+            f"Sending goal → {target} | "
+            f"stop @ ({x:.2f}, {y:.2f}) "
+            f"| safety dist: {self.safety_distance}m")
+
+        send_goal_future = self._action_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self.feedback_callback
+        )
+        send_goal_future.add_done_callback(self.goal_response_callback)
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error("Goal rejected by Nav2!")
+            return
+        self.get_logger().info("Goal accepted by Nav2")
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.result_callback)
+
+    def result_callback(self, future):
+        result = future.result().result
+        if result.error_code == 0:
+            self.get_logger().info("Navigation complete successfully!")
+        else:
+            self.get_logger().warn(
+                f"Navigation failed | error_code: {result.error_code} "
+                f"| {result.error_msg}")
+
+    def feedback_callback(self, feedback_msg):
+        dist = feedback_msg.feedback.distance_remaining
+        self.get_logger().info(
+            f"Distance remaining: {dist:.2f}m",
+            throttle_duration_sec=2.0)
+
+
+def main():
+    rclpy.init()
+    node = GoalSender()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
+
